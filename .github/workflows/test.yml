@@ -1,36 +1,130 @@
+name: Tests
+
+# This file runs the same tests as the Go LUCI trybots that Commit-Queue+1
+# starts for google.golang.org/protobuf, one job per builder.
+#
+# It follows the protection strategy of protocolbuffers/protobuf (see
+# go/protobuf-gha-protected-resources).  Pull requests from branches within
+# this repository are considered safe and will immediately start running tests
+# on every commit.  Pull requests from forked repositories are unsafe, so we
+# require a special "safe for tests" tag to be added to the pull request before
+# we start testing.  This will be immediately removed, so that further commits
+# require their own stamp to test.
+
 on:
+  # postsubmit
   push:
+    branches:
+      - master
+      - staging
+
+  # continuous
   schedule:
-    - cron: '0 0 * * *'
-name: Test
+    # Run daily at midnight UTC
+    - cron: "0 0 * * *"
+
+  # safe presubmit
+  pull_request:
+    branches:
+      - master
+      - staging
+
+  # unsafe presubmit
+  pull_request_target:
+    branches:
+      - master
+      - staging
+    types: [labeled, opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+env:
+  # Always use the Go toolchain installed below, like LUCI.
+  GOTOOLCHAIN: local
+
 jobs:
   test:
+    # Avoid running tests twice on PR updates.  If the PR is coming from our
+    # repository, it's safe and we can use `pull_request`.  Otherwise, we should
+    # use `pull_request_target`, and only once the safe label has been added.
+    if: |
+      (github.event_name != 'pull_request' &&
+       github.event_name != 'pull_request_target' &&
+       github.event.repository.full_name == 'shaod2/protobuf-go') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == 'shaod2/protobuf-go') ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name != 'shaod2/protobuf-go' &&
+       github.event.label.name == ':a: safe for tests')
     strategy:
+      fail-fast: false   # Don't cancel all jobs if one fails.
       matrix:
-        # This is just a version to compile the integration_test.go; see
-        # golangVersions in that file for the list of actual Go versions used.
-        go-version: [1.x]
-        os: [ubuntu-latest] # TODO: Add [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        config:
+          - { name: go1.26-linux-amd64, go: release-branch.go1.26, flags: -short }
+          - { name: go1.27-linux-amd64, go: release-branch.go1.27, flags: -short }
+          - { name: gotip-linux-amd64, flags: -short }
+          - { name: gotip-linux-amd64-boringcrypto, flags: -short, goexperiment: boringcrypto }
+          - { name: gotip-linux-amd64-longtest, flags: -timeout=50m, longtest: true }
+          - { name: gotip-linux-amd64-misccompile, misccompile: true }
+          - { name: gotip-linux-amd64-race, flags: -short -race -timeout=20m }
+          - { name: gotip-linux-amd64_debian11, flags: -short, container: "buildpack-deps:bullseye" }
+          - { name: gotip-linux-amd64_debian13, flags: -short, container: "buildpack-deps:trixie" }
+    name: ${{ matrix.config.name }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.config.container }}
     steps:
-    - name: Install Linux dependencies
-      if: runner.os == 'Linux'
-      run: sudo apt-get -y install autoconf automake libtool curl make g++ unzip
-    - name: Checkout code
-      uses: actions/checkout@v3
-    - name: Install Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: ${{ matrix.go-version }}
-    - name: Cache dependencies
-      uses: actions/cache@v3
-      with:
-        path: |
-          .cache
-          ~/.cache/bazel
-        key: ${{ runner.os }}-${{ hashFiles('integration_test.go') }}
-    - name: Test
-      env:
-        # Protobuf 36 requires at least Bazel 8
-        USE_BAZEL_VERSION: 8.x
-      run: go test -run='^TestIntegration$' -v -timeout=60m -count=1 -failfast "$@"
+      - name: Checkout pending changes
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        with:
+          # For forks, test the PR head.  Otherwise, use the default ref.
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.sha || '' }}
+          persist-credentials: false
+      - name: Install bootstrap Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417  # v6.3.0
+        with:
+          go-version: stable
+          cache: false
+      - name: Install Go ${{ matrix.config.go || 'tip' }}
+        run: |
+          go install golang.org/dl/gotip@latest
+          "$(go env GOPATH)/bin/gotip" download ${{ matrix.config.go }}
+          echo "$HOME/sdk/gotip/bin" >> "$GITHUB_PATH"
+      - name: Run tests
+        if: ${{ !matrix.config.misccompile }}
+        env:
+          GOEXPERIMENT: ${{ matrix.config.goexperiment }}
+        run: go test ${{ matrix.config.flags }} ./...
+      # On LUCI, GO_BUILDER_NAME makes the longtest builder run TestIntegration
+      # as part of "go test ./...".  Here it has to be requested explicitly.
+      - name: Run integration test
+        if: ${{ matrix.config.longtest }}
+        env:
+          USE_BAZEL_VERSION: 8.x   # Protobuf 36 requires at least Bazel 8
+        run: go test -run='^TestIntegration$' -v -timeout=50m .
+      # Same ports as LUCI: all except first-class ports (darwin and arm are
+      # kept), ios and android.  Like LUCI, keep going after a failure and
+      # report all failing ports at the end.
+      - name: Compile tests for other ports
+        if: ${{ matrix.config.misccompile }}
+        run: |
+          failed=
+          for port in $(go tool dist list -json | jq -r '.[] | select((.FirstClass and .GOOS != "darwin" and .GOARCH != "arm") or .GOOS == "ios" or .GOOS == "android" | not) | "\(.GOOS)/\(.GOARCH)"'); do
+            GOOS=${port%/*} GOARCH=${port#*/} go test -c -o /dev/null ./... || failed="$failed $port"
+          done
+          test -z "$failed" || { echo "Failed to compile tests for:$failed"; exit 1; }
+
+  remove-tag:
+    name: Remove safety tag
+    if: |
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == ':a: safe for tests'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions-ecosystem/action-remove-labels@2ce5d41b4b6aa8503e285553f75ed56e0a40bae0  # v1.3.0
+        with:
+          fail_on_error: true
+          labels: ':a: safe for tests'
