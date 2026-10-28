@@ -73,6 +73,10 @@ jobs:
     name: ${{ matrix.config.name }}
     runs-on: ubuntu-latest
     container: ${{ matrix.config.container }}
+    env:
+      # Same as LUCI.  In the longtest builder, it makes "go test ./..." also
+      # run TestIntegration, with the prebuilt protoc downloaded below.
+      GO_BUILDER_NAME: z_protobuf-${{ matrix.config.name }}
     steps:
       - name: Checkout pending changes
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
@@ -90,18 +94,18 @@ jobs:
           go install golang.org/dl/gotip@latest
           "$(go env GOPATH)/bin/gotip" download ${{ matrix.config.go }}
           echo "$HOME/sdk/gotip/bin" >> "$GITHUB_PATH"
+      # Same prebuilt protoc and conformance test runner as LUCI.
+      - name: Download prebuilt protoc
+        if: ${{ matrix.config.longtest }}
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/protoc.zip" https://chrome-infra-packages.appspot.com/dl/golang/third_party/protoc_with_conformance/linux-amd64/+/version:v36.2
+          unzip -q -d "$RUNNER_TEMP/protoc" "$RUNNER_TEMP/protoc.zip" protoc conformance_test_runner
+          echo "$RUNNER_TEMP/protoc" >> "$GITHUB_PATH"
       - name: Run tests
         if: ${{ !matrix.config.misccompile }}
         env:
           GOEXPERIMENT: ${{ matrix.config.goexperiment }}
         run: go test ${{ matrix.config.flags }} ./...
-      # On LUCI, GO_BUILDER_NAME makes the longtest builder run TestIntegration
-      # as part of "go test ./...".  Here it has to be requested explicitly.
-      - name: Run integration test
-        if: ${{ matrix.config.longtest }}
-        env:
-          USE_BAZEL_VERSION: 8.x   # Protobuf 36 requires at least Bazel 8
-        run: go test -run='^TestIntegration$' -v -timeout=50m .
       # Same ports as LUCI: all except first-class ports (darwin and arm are
       # kept), ios and android.  Like LUCI, keep going after a failure and
       # report all failing ports at the end.
